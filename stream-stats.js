@@ -1,0 +1,149 @@
+/*
+ * stream-stats.js — playback diagnostics overlay for the Lampa player
+ *
+ * Shows, once a second, why a stream stutters: resolution, buffered seconds
+ * ahead of the playhead, buffer fill rate (>1x means the source is faster
+ * than playback), dropped frames and, for TorrServe streams, download speed,
+ * peers and seeders.
+ *
+ * Works in the built-in Lampa player only; external players (VLC, MX) have
+ * their own statistics screens.
+ *
+ * Install: Settings → Extensions → Add plugin → https://diviper.github.io/lampa-plugins/stream-stats.js
+ */
+
+(function () {
+  'use strict';
+
+  var CONFIG = {
+    interval: 1000,          // ms between overlay updates
+    torrentInterval: 2000,   // ms between TorrServe statistics requests
+    hideWithPanel: false,    // true = show only while the player panel is visible
+    position: 'top-right',   // top-left | top-right | bottom-left | bottom-right
+    fontSize: '1.05em'
+  };
+
+  if (window.lampa_plugin_stream_stats) return;
+  window.lampa_plugin_stream_stats = true;
+
+  var box, timer, torrentTimer, network;
+  var last = { time: 0, ahead: 0 };
+  var torrent = null;
+
+  var css = [
+    '.stream-stats{position:absolute;z-index:8;padding:.55em .8em;border-radius:.6em;background:rgba(0,0,0,.55);',
+    'color:#fff;font-size:' + CONFIG.fontSize + ';line-height:1.35;pointer-events:none;white-space:nowrap;text-shadow:0 1px 2px rgba(0,0,0,.6)}',
+    '.stream-stats--top-right{top:1.2em;right:1.2em}.stream-stats--top-left{top:1.2em;left:1.2em}',
+    '.stream-stats--bottom-right{bottom:6em;right:1.2em}.stream-stats--bottom-left{bottom:6em;left:1.2em}',
+    '.stream-stats__row span{opacity:.6;margin-right:.4em}',
+    '.stream-stats--ok{color:#8be28b}.stream-stats--warn{color:#ffd166}.stream-stats--bad{color:#ff6b6b}'
+  ].join('');
+
+  function bytes(value, bits) {
+    if (!value) return '0';
+    var v = bits ? value * 8 : value;
+    var units = bits ? ['бит/с', 'Кбит/с', 'Мбит/с', 'Гбит/с'] : ['Б', 'КБ', 'МБ', 'ГБ'];
+    var i = 0;
+    while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+    return (i ? v.toFixed(1) : Math.round(v)) + ' ' + units[i];
+  }
+
+  function bufferedAhead(video) {
+    var ranges = video.buffered;
+    for (var i = 0; i < ranges.length; i++) {
+      if (ranges.start(i) <= video.currentTime && video.currentTime <= ranges.end(i)) return ranges.end(i) - video.currentTime;
+    }
+    return 0;
+  }
+
+  function rowClass(value, good, ok) {
+    return value >= good ? 'stream-stats--ok' : value >= ok ? 'stream-stats--warn' : 'stream-stats--bad';
+  }
+
+  function render() {
+    var video = Lampa.PlayerVideo.video();
+    if (!box || !video || !video.buffered) return;
+
+    var now = Date.now();
+    var ahead = bufferedAhead(video);
+    var rows = [];
+
+    if (video.videoWidth) rows.push('<div class="stream-stats__row"><span>видео</span>' + video.videoWidth + 'x' + video.videoHeight + '</div>');
+
+    rows.push('<div class="stream-stats__row ' + rowClass(ahead, 15, 5) + '"><span>буфер</span>' + Math.round(ahead) + ' с</div>');
+
+    if (last.time && !video.paused) {
+      var dt = (now - last.time) / 1000;
+      var rate = dt > 0 ? (ahead - last.ahead) / dt + 1 : 1;   // buffer growth relative to playback
+      rows.push('<div class="stream-stats__row ' + rowClass(rate, 1, 0.8) + '"><span>приток</span>' + rate.toFixed(2) + 'x</div>');
+    }
+
+    if (video.getVideoPlaybackQuality) {
+      var q = video.getVideoPlaybackQuality();
+      rows.push('<div class="stream-stats__row ' + rowClass(-q.droppedVideoFrames, 0, -50) + '"><span>кадры</span>' + q.droppedVideoFrames + ' пропущено из ' + q.totalVideoFrames + '</div>');
+    }
+
+    if (torrent) {
+      rows.push('<div class="stream-stats__row ' + rowClass(torrent.download_speed || 0, 1500000, 500000) + '"><span>торрент</span>' + bytes(torrent.download_speed, true) + '</div>');
+      rows.push('<div class="stream-stats__row"><span>пиры</span>' + (torrent.active_peers || 0) + ' / ' + (torrent.total_peers || 0) + ', сиды ' + (torrent.connected_seeders || 0) + '</div>');
+    }
+
+    last = { time: now, ahead: ahead };
+    box.innerHTML = rows.join('');
+  }
+
+  function pollTorrent(data) {
+    var ip = Lampa.Torserver.ip();
+    if (!ip || !data.url || data.url.indexOf(ip) === -1) return;
+
+    var url = data.url.replace('&preload', '&stat').replace('&play', '&stat');
+    if (url === data.url) return;
+
+    network = new Lampa.Reguest();
+    var tick = function () {
+      network.timeout(1500);
+      network.silent(url, function (result) { torrent = result.Torrent || result; }, function () {});
+    };
+    tick();
+    torrentTimer = setInterval(tick, CONFIG.torrentInterval);
+  }
+
+  function show(data) {
+    hide();
+    box = document.createElement('div');
+    box.className = 'stream-stats stream-stats--' + CONFIG.position;
+    Lampa.Player.render().append(box);
+
+    last = { time: 0, ahead: 0 };
+    torrent = null;
+    timer = setInterval(render, CONFIG.interval);
+    pollTorrent(data);
+  }
+
+  function hide() {
+    clearInterval(timer);
+    clearInterval(torrentTimer);
+    if (network) network.clear();
+    if (box && box.parentNode) box.parentNode.removeChild(box);
+    box = null;
+    torrent = null;
+  }
+
+  function start() {
+    var style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+
+    Lampa.Player.listener.follow('start', show);
+    Lampa.Player.listener.follow('destroy', hide);
+
+    if (CONFIG.hideWithPanel) {
+      Lampa.PlayerPanel.listener.follow('visible', function (event) {
+        if (box) box.style.display = event.status ? '' : 'none';
+      });
+    }
+  }
+
+  if (window.appready) start();
+  else Lampa.Listener.follow('app', function (event) { if (event.type === 'ready') start(); });
+})();
