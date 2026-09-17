@@ -25,6 +25,7 @@
 
     openLastMethod: true,           // OK on a card reopens the list it was last watched from
     autoPlayNext: true,             // and picks the episode to continue with
+    autoOpenRelease: true,          // for torrents, opens the release watched before (marked as viewed by Lampa)
     nextThreshold: 90,              // percent above which the episode counts as finished
     autoPlayTimeout: 10000,         // ms to wait for the source list to render
     autoPlayPoll: 400,              // ms between attempts to find the episode row
@@ -290,6 +291,24 @@
     }, CONFIG.autoPlayPoll);
   }
 
+  // Lampa marks releases that were opened before and lists them first, so a
+  // viewed release on top is the one this title was watched from.
+  function openRelease() {
+    var started = Date.now();
+
+    var timer = setInterval(function () {
+      var active = Lampa.Activity.active();
+
+      if (!active || active.component !== 'torrents' || Date.now() - started > CONFIG.autoPlayTimeout) return clearInterval(timer);
+
+      var first = active.activity.render().find('.torrent-item').first();
+      if (!first.length) return;
+
+      clearInterval(timer);
+      if (first.find('.torrent-item__viewed').length) first.trigger('hover:enter');
+    }, CONFIG.autoPlayPoll);
+  }
+
   function trackActivities() {
     Lampa.Listener.follow('activity', function (event) {
       if (event.type !== 'create' || !event.object) return;
@@ -326,6 +345,7 @@
 
         var hash = hashOf(id);
         if (method === 'online' && CONFIG.autoPlayNext && hash) setTimeout(function () { playEpisode(hash); }, 300);
+        if (method === 'torrent' && CONFIG.autoOpenRelease) setTimeout(openRelease, 300);
       }, CONFIG.openDelay);
     });
   }
