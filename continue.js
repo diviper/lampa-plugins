@@ -79,10 +79,18 @@
     });
   }
 
+  // Account plugins can arrive after the home screen is already drawn;
+  // rebuild it once so the row shows up on the first start too.
+  function redrawHome() {
+    var active = Lampa.Activity.active();
+    if (active && active.component === 'main') Lampa.Activity.replace({});
+  }
+
   function start() {
     if (CONFIG.hideBuiltInRow) Lampa.Storage.set('content_rows_continue_watch', false);
     addRow();
     if (CONFIG.openSourcesOnSelect) openSources();
+    redrawHome();
   }
 
   if (window.appready) start();
