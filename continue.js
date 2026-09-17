@@ -21,6 +21,7 @@
     showProgress: true,             // progress strip and episode badge on the cards
     maxSeasons: 10,                 // scan depth when the card does not report its season count
     maxEpisodes: 300,               // scan depth per season
+    decorateTries: 20,              // attempts, 300 ms apart, to catch the row once it is drawn
 
     openLastMethod: true,           // OK on a card reopens the list it was last watched from
     autoPlayNext: true,             // and picks the episode to continue with
@@ -205,28 +206,38 @@
     }
   }
 
+  // Lampa keeps the previous screen in the DOM while it builds the next one,
+  // so always look inside the activity that is on screen right now.
+  function findRow() {
+    var active = Lampa.Activity.active();
+    var root = active && active.activity ? active.activity.render() : $('body');
+    var title = Lampa.Lang.translate('title_continue');
+    var found = null;
+
+    root.find('.items-line').each(function () {
+      if (!found && $(this).find('.items-line__title').text().trim() === title) found = $(this);
+    });
+
+    return found;
+  }
+
   function decorateRow(results) {
     if (!CONFIG.showProgress) return;
 
-    var title = Lampa.Lang.translate('title_continue');
     var tries = 0;
 
     var timer = setInterval(function () {
       tries++;
 
-      var line = null;
-      $('.items-line').each(function () {
-        if ($(this).find('.items-line__title').text().trim() === title) line = $(this);
-      });
-
+      var line = findRow();
       var cards = line ? line.find('.card') : [];
+      var ready = cards.length >= results.length;
 
-      if (cards.length) {
-        clearInterval(timer);
-        cards.each(function (index) { decorateCard($(this), results[index]); });
-      } else if (tries > 20) {
-        clearInterval(timer);
-      }
+      if (!cards.length && tries <= CONFIG.decorateTries) return;
+      if (!ready && tries <= CONFIG.decorateTries) return;   // the row is still filling up
+
+      clearInterval(timer);
+      cards.each(function (index) { decorateCard($(this), results[index]); });
     }, 300);
   }
 
