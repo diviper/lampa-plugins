@@ -143,13 +143,19 @@
 
   // The trailer treatment applies to one card: the one opened straight from
   // our list or our row. Anything opened afterwards behaves normally.
+  // At 'create' time the new screen is not in the stack yet, so the screen it
+  // was opened from is the last stack entry that is not the new one.
   function cameFromUs(object) {
     if (object.card && object.card.trailers_card) return true;
     try {
       var stack = Lampa.Activity.all();
-      var previous = stack[stack.length - 2];
-      return !!(previous && previous.trailers_list);
-    } catch (e) { return false; }
+      for (var i = stack.length - 1; i >= 0; i--) {
+        var entry = stack[i];
+        if (entry === object || (entry.activity && entry.activity === object.activity)) continue;
+        return !!entry.trailers_list;
+      }
+    } catch (e) {}
+    return false;
   }
 
   function trackActivities() {
