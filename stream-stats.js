@@ -26,14 +26,15 @@
     warnAfterSeconds: 8,     // how long inflow must stay below 1x
     warnBufferSeconds: 10,   // and the buffer below this
     warnCooldown: 90000,     // ms between warnings
-    warnText: 'Поток слабый: буфер не набирается. Смените раздачу или источник.'
+    warnText: 'Поток слабый: буфер не набирается. Смените раздачу или источник.',
+    stallText: 'Видео встало: данные не приходят. Смените раздачу или источник.'
   };
 
   if (window.lampa_plugin_stream_stats) return;
   window.lampa_plugin_stream_stats = true;
 
   var box, timer, torrentTimer, network;
-  var last = { time: 0, ahead: 0 };
+  var last = { time: 0, ahead: 0, position: -1 };
   var torrent = null;
   var weakSeconds = 0;
   var warnedAt = 0;
@@ -69,11 +70,16 @@
   }
 
   // A stream that cannot refill its buffer will stall, so say so once in a
-  // while instead of leaving the viewer to guess.
-  function warn(rate, ahead, dt, now) {
+  // while instead of leaving the viewer to guess. Two cases count: playback
+  // that is running but losing ground, and playback frozen for want of data.
+  // A deliberate pause keeps readyState at HAVE_ENOUGH_DATA, so it stays quiet.
+  function warn(video, rate, ahead, moving, dt, now) {
     if (!CONFIG.warn) return;
 
-    if (rate >= 1 || ahead > CONFIG.warnBufferSeconds) {
+    var stalled = !moving && video.readyState < 3;
+    var weak = !video.paused && rate < 1 && ahead < CONFIG.warnBufferSeconds;
+
+    if (!stalled && !weak) {
       weakSeconds = 0;
       return;
     }
@@ -84,7 +90,7 @@
 
     warnedAt = now;
     weakSeconds = 0;
-    Lampa.Noty.show(CONFIG.warnText, { time: 6000 });
+    Lampa.Noty.show(stalled ? CONFIG.stallText : CONFIG.warnText, { time: 6000 });
   }
 
   function render() {
@@ -93,18 +99,21 @@
 
     var now = Date.now();
     var ahead = bufferedAhead(video);
+    var moving = video.currentTime !== last.position;
+    var dt = last.time ? (now - last.time) / 1000 : 0;
+    var rate = dt > 0 && !video.paused ? (ahead - last.ahead) / dt + 1 : 1;
     var rows = [];
 
     if (video.videoWidth) rows.push('<div class="stream-stats__row"><span>видео</span>' + video.videoWidth + 'x' + video.videoHeight + '</div>');
 
     rows.push('<div class="stream-stats__row ' + rowClass(ahead, 15, 5) + '"><span>буфер</span>' + Math.round(ahead) + ' с</div>');
 
-    if (last.time && !video.paused) {
-      var dt = (now - last.time) / 1000;
-      var rate = dt > 0 ? (ahead - last.ahead) / dt + 1 : 1;   // buffer growth relative to playback
+    // buffer growth relative to playback: below 1x the source falls behind
+    if (dt > 0 && !video.paused) {
       rows.push('<div class="stream-stats__row ' + rowClass(rate, 1, 0.8) + '"><span>приток</span>' + rate.toFixed(2) + 'x</div>');
-      warn(rate, ahead, dt, now);
     }
+
+    if (dt > 0) warn(video, rate, ahead, moving, dt, now);
 
     if (video.getVideoPlaybackQuality) {
       var q = video.getVideoPlaybackQuality();
@@ -116,7 +125,7 @@
       rows.push('<div class="stream-stats__row"><span>пиры</span>' + (torrent.active_peers || 0) + ' / ' + (torrent.total_peers || 0) + ', сиды ' + (torrent.connected_seeders || 0) + '</div>');
     }
 
-    last = { time: now, ahead: ahead };
+    last = { time: now, ahead: ahead, position: video.currentTime };
     box.innerHTML = rows.join('');
   }
 
@@ -142,7 +151,7 @@
     box.className = 'stream-stats stream-stats--' + CONFIG.position;
     Lampa.Player.render().append(box);
 
-    last = { time: 0, ahead: 0 };
+    last = { time: 0, ahead: 0, position: -1 };
     torrent = null;
     weakSeconds = 0;
     warnedAt = 0;
