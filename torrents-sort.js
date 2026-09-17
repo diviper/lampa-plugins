@@ -606,7 +606,9 @@
     try {
       var scroll = Lampa.Modal.scroll();
       Lampa.Controller.collectionFocus(target, scroll.render());
-      scroll.update(target, true);
+      // the animated scroll gets cut short on long lists, jump instead
+      if (scroll.immediate) scroll.immediate(target, true);
+      else scroll.update(target, true);
       Lampa.Layer.visible(scroll.render(true));
     } catch (e) {}
   }
