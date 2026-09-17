@@ -1,60 +1,90 @@
+/*
+ * continue.js — "Continue watching" row for Lampa
+ *
+ * Adds the viewing history as the first row of the home screen, regardless of
+ * media type, and opens the online sources list straight from the card so a
+ * show can be resumed in two presses instead of five.
+ *
+ * Install: Settings → Extensions → Add plugin → https://diviper.github.io/lampa-plugins/continue.js
+ */
+
 (function () {
   'use strict';
-  // «Продолжить просмотр» для всех типов (аниме, сериалы, фильмы) первой строкой на главной.
-  // OK по карточке сразу открывает список источников/серий (кнопка «Онлайн» online_mod).
-  if (window.plugin_continue_all_ready) return;
-  window.plugin_continue_all_ready = true;
 
-  var pending = null;
+  var CONFIG = {
+    rowName: 'continue_all',        // storage key: content_rows_continue_all (Settings → Home rows)
+    rowIndex: 0,                    // 0 = first row on the home screen
+    maxItems: 19,                   // Lampa shows up to 20 cards per row
+    hideBuiltInRow: true,           // the stock row only lists non-Japanese series
+    openSourcesOnSelect: true,      // OK on a card opens the online sources list
+    sourceButton: '.view--online_mod',
+    openDelay: 500                  // ms, lets other plugins attach their buttons first
+  };
 
-  function items() {
-    var hist = Lampa.Favorite.get({ type: 'history' });
-    var skip = Lampa.Favorite.get({ type: 'viewed' }).concat(Lampa.Favorite.get({ type: 'thrown' }));
-    return hist
-      .filter(function (c) { return !skip.find(function (v) { return v.id == c.id; }); })
-      .slice(0, 19)
-      .map(function (c) {
-        var k = Lampa.Arrays.clone(c);
-        k.__continue_all = true;
-        return k;
+  if (window.lampa_plugin_continue) return;
+  window.lampa_plugin_continue = true;
+
+  var pendingCardId = null;
+
+  function history() {
+    var seen = Lampa.Favorite.get({ type: 'viewed' })
+      .concat(Lampa.Favorite.get({ type: 'thrown' }))
+      .map(function (card) { return card.id; });
+
+    return Lampa.Favorite.get({ type: 'history' })
+      .filter(function (card) { return seen.indexOf(card.id) === -1; })
+      .slice(0, CONFIG.maxItems)
+      .map(function (card) {
+        var copy = Lampa.Arrays.clone(card);
+        copy.continue_row = true;
+        return copy;
       });
   }
 
-  function start() {
-    // встроенная строка показывает только неяпонские сериалы, чтобы не дублировалась - выключаем
-    Lampa.Storage.set('content_rows_continue_watch', false);
-
+  function addRow() {
     Lampa.ContentRows.add({
-      name: 'continue_all',
+      name: CONFIG.rowName,
       title: Lampa.Lang.translate('title_continue'),
-      index: 0,
+      index: CONFIG.rowIndex,
       screen: ['main'],
       call: function () {
-        var results = items();
+        var results = history();
         if (!results.length) return;
+
         return function (call) {
           call({ results: results, title: Lampa.Lang.translate('title_continue') });
         };
       }
     });
+  }
 
-    Lampa.Listener.follow('activity', function (e) {
-      if (e.type == 'create' && e.component == 'full' && e.object && e.object.card && e.object.card.__continue_all) {
-        pending = e.object.id;
+  function openSources() {
+    Lampa.Listener.follow('activity', function (event) {
+      var object = event.object;
+
+      if (event.type === 'create' && event.component === 'full' && object && object.card && object.card.continue_row) {
+        pendingCardId = object.id;
       }
     });
 
-    Lampa.Listener.follow('full', function (e) {
-      if (e.type == 'complite' && pending && e.object && e.object.id == pending) {
-        pending = null;
-        setTimeout(function () {
-          var btn = e.object.activity.render().find('.view--online_mod');
-          if (btn.length) btn.trigger('hover:enter');
-        }, 500);
-      }
+    Lampa.Listener.follow('full', function (event) {
+      if (event.type !== 'complite' || !pendingCardId || !event.object || event.object.id !== pendingCardId) return;
+
+      pendingCardId = null;
+
+      setTimeout(function () {
+        var button = event.object.activity.render().find(CONFIG.sourceButton);
+        if (button.length) button.trigger('hover:enter');
+      }, CONFIG.openDelay);
     });
   }
 
+  function start() {
+    if (CONFIG.hideBuiltInRow) Lampa.Storage.set('content_rows_continue_watch', false);
+    addRow();
+    if (CONFIG.openSourcesOnSelect) openSources();
+  }
+
   if (window.appready) start();
-  else Lampa.Listener.follow('app', function (e) { if (e.type == 'ready') start(); });
+  else Lampa.Listener.follow('app', function (event) { if (event.type === 'ready') start(); });
 })();
