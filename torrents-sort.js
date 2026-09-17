@@ -97,7 +97,7 @@
     '.tsmart .tsmart__warn{background:rgba(239,83,80,.25);color:#ffb4ab}',
     '.tsmart .tsmart__good{background:rgba(76,175,80,.25);color:#b9f6ca}',
     '.torrent-item--best{box-shadow:inset .3em 0 0 0 #4caf50}',
-    '.tsmart-resume{display:inline-block;margin-left:.6em;padding:0 .5em;border-radius:.4em;background:#4caf50;color:#fff;font-size:.8em;font-weight:700}'
+    '.tsmart-resume{display:inline-block;margin-right:.6em;padding:0 .5em;border-radius:.4em;background:#4caf50;color:#fff;font-size:.9em;font-weight:700}'
   ].join('');
 
   // --- storage -------------------------------------------------------------
@@ -587,12 +587,28 @@
     if (index < 0 || index >= files.length) return;
 
     var target = files[index].item;
-    var title = target.find('.torrent-serial__title, .torrent-files__title').first();
-    (title.length ? title : target).append('<span class="tsmart-resume">▶ ' + label + '</span>');
+    var badge = '<span class="tsmart-resume">▶ ' + label + '</span>';
+    var line = target.find('.torrent-serial__line').first();
+    // titles are cut with an ellipsis, so the badge goes on the line below or in front
+    if (line.length) line.prepend(badge);
+    else target.find('.torrent-files__title, .torrent-file__title').first().prepend(badge);
 
-    try { Lampa.Controller.collectionFocus(target, Lampa.Modal.scroll().render()); } catch (e) {}
+    focusFile(target);
+    // rows change height as their previews load, so settle the position once more
+    setTimeout(function () { focusFile(target); }, 500);
 
     if (CONFIG.autoPlay) startAuto(target);
+  }
+
+  // A long list scrolls by transform, and rows stay hidden until the layer
+  // code sees them on screen; move the scroll itself and refresh visibility.
+  function focusFile(target) {
+    try {
+      var scroll = Lampa.Modal.scroll();
+      Lampa.Controller.collectionFocus(target, scroll.render());
+      scroll.update(target, true);
+      Lampa.Layer.visible(scroll.render(true));
+    } catch (e) {}
   }
 
   function followFiles() {
