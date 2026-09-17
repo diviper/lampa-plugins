@@ -593,24 +593,38 @@
     if (line.length) line.prepend(badge);
     else target.find('.torrent-files__title, .torrent-file__title').first().prepend(badge);
 
-    focusFile(target);
-    // rows change height as their previews load, so settle the position once more
-    setTimeout(function () { focusFile(target); }, 500);
+    focusFile(target, 0);
 
     if (CONFIG.autoPlay) startAuto(target);
   }
 
-  // A long list scrolls by transform, and rows stay hidden until the layer
-  // code sees them on screen; move the scroll itself and refresh visibility.
-  function focusFile(target) {
+  // A long list scrolls by transform, rows far from the screen are laid out
+  // with a placeholder height, and rows stay hidden until the layer code sees
+  // them. So jump, let the rows around the landing spot render, check that the
+  // target is really on screen, and jump again until it is.
+  function focusFile(target, attempt) {
+    var scroll;
     try {
-      var scroll = Lampa.Modal.scroll();
-      Lampa.Controller.collectionFocus(target, scroll.render());
-      // the animated scroll gets cut short on long lists, jump instead
+      scroll = Lampa.Modal.scroll();
+      if (!attempt) Lampa.Controller.collectionFocus(target, scroll.render());
       if (scroll.immediate) scroll.immediate(target, true);
       else scroll.update(target, true);
       Lampa.Layer.visible(scroll.render(true));
-    } catch (e) {}
+    } catch (e) {
+      return;
+    }
+
+    setTimeout(function () {
+      var node = target[0];
+      var view = scroll.render(true);
+      if (!node || !view || !document.body.contains(node)) return;
+
+      var row = node.getBoundingClientRect();
+      var box = view.getBoundingClientRect();
+      var onScreen = row.top >= box.top && row.bottom <= box.bottom;
+
+      if (!onScreen && attempt < 15) focusFile(target, attempt + 1);
+    }, 150);
   }
 
   function followFiles() {
