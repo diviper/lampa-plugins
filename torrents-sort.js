@@ -1,5 +1,6 @@
 /*
  * torrents-sort.js — picks the torrent you actually want
+ * Version 2.1.0
  *
  * Lampa sorts releases by seeders, which on a Russian tracker means a 790 GB
  * Blu-ray remux with only English audio can sit above a 1080p dub that plays
@@ -8,19 +9,24 @@
  *   - Russian audio and the kind of voice-over (dub, multi-voice, single);
  *   - resolution that suits a Full HD screen, source quality, HDR;
  *   - bitrate per episode, so heavy remuxes that stall over Wi-Fi sink;
+ *   - a sensible size for a film;
  *   - for series, whether the release contains the episode you stopped at;
  *   - the voice-over you picked for this title before;
+ *   - releases already sitting in TorrServer, which start at once;
  *   - seeders, on a log scale so a few more do not outweigh the rest.
  *
  * Each row shows its score and the reasons. Inside a release the file list
  * jumps to the episode you stopped at and starts it after a short countdown;
  * any key cancels.
  *
+ * Settings: Lampa → Settings → My plugins.
  * Install: Settings → Extensions → Add plugin → https://diviper.github.io/lampa-plugins/torrents-sort.js
  */
 
 (function () {
   'use strict';
+
+  var VERSION = '2.1.0';
 
   var CONFIG = {
     // what to drop before the list is built
@@ -40,23 +46,80 @@
     minMbit: { 1080: 2, 720: 1, 480: 0.5 },
     comfortMbit: 14,
     heavyMbit: 25,
+    filmSizeGb: { 1080: [1.5, 15], 720: [0.7, 8], 480: [0.5, 4] },
     runtimeAnime: 24,           // minutes, when the card does not say
     runtimeSeries: 45,
     runtimeFilm: 110,
 
     // file list inside a release
     focusEpisode: true,
-    autoPlay: true,
-    autoPlaySeconds: 8,
+    autoPlaySeconds: 8,         // 0 = no countdown
     nextThreshold: 90,          // percent after which the episode counts as finished
 
     learnVoices: true,
+    cachedBoost: true,          // releases already in TorrServer
     storageKey: 'torrents_smart',
     historyLimit: 100
   };
 
   if (window.lampa_plugin_torrents_smart) return;
-  window.lampa_plugin_torrents_smart = true;
+  window.lampa_plugin_torrents_smart = VERSION;
+
+  // --- shared bits: settings section, guarded handlers -----------------------
+
+  var SETTINGS = 'dvp';
+  var ICON = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="4" width="18" height="16" rx="3" stroke="currentColor" stroke-width="2"/><path d="M8 9h8M8 13h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
+  function safe(fn, where) {
+    return function () {
+      try { return fn.apply(this, arguments); }
+      catch (e) { console.error('[dvp torrents] ' + (where || ''), e); }
+    };
+  }
+
+  function settingsSection() {
+    if (window.dvp_settings) return;
+    window.dvp_settings = true;
+    Lampa.SettingsApi.addComponent({ component: SETTINGS, icon: ICON, name: 'Мои плагины' });
+  }
+
+  function heading(name) {
+    Lampa.SettingsApi.addParam({ component: SETTINGS, param: { name: 'dvp_head_' + name, type: 'title' }, field: { name: name } });
+  }
+
+  function option(key, def, name, description, values) {
+    Lampa.SettingsApi.addParam({
+      component: SETTINGS,
+      param: { name: 'dvp_' + key, type: values ? 'select' : 'trigger', values: values, default: def },
+      field: { name: name, description: description }
+    });
+  }
+
+  function opt(key, def) {
+    var value = Lampa.Storage.get('dvp_' + key, def);
+    return value === '' ? def : value;
+  }
+
+  function applySettings() {
+    CONFIG.smartSort = opt('torrents_smart', CONFIG.smartSort);
+    CONFIG.hide4K = opt('torrents_hide4k', CONFIG.hide4K);
+    CONFIG.hideNoRussian = opt('torrents_rusonly', CONFIG.hideNoRussian);
+    CONFIG.showScore = opt('torrents_score', CONFIG.showScore);
+    CONFIG.autoPlaySeconds = parseInt(opt('torrents_autoplay', CONFIG.autoPlaySeconds), 10) || 0;
+  }
+
+  function registerSettings() {
+    settingsSection();
+    heading('Умный торрент ' + VERSION);
+    option('torrents_smart', true, 'Сортировать по оценке', 'Русская озвучка, качество под Full HD, нужная серия, тяжесть потока, сиды');
+    option('torrents_score', true, 'Показывать оценку и причины', 'Строка с оценкой под названием раздачи');
+    option('torrents_hide4k', true, 'Прятать 4K', 'Телевизор Full HD, 2160p ему не по силам');
+    option('torrents_rusonly', false, 'Только с русской дорожкой', 'Иначе раздачи без русского просто уходят вниз');
+    option('torrents_autoplay', '8', 'Автозапуск серии в раздаче', 'Через сколько секунд включить серию, на которой остановились', { '0': 'Выключен', '5': '5 секунд', '8': '8 секунд', '12': '12 секунд' });
+    Lampa.Storage.listener.follow('change', safe(function (event) {
+      if (event.name && event.name.indexOf('dvp_torrents_') === 0) applySettings();
+    }, 'settings'));
+  }
 
   var GB = 1024 * 1024 * 1024;
   var RE_4K = /(4k|uhd)[ \]|,]|2160[pр]|ultrahd/i;
@@ -133,6 +196,36 @@
     return isNaN(seeds) ? 0 : seeds;
   }
 
+  // info hash from the magnet link, as lowercase hex
+  function btihOf(element) {
+    var magnet = (element.MagnetUri || element.Link || '') + '';
+    var m = magnet.match(/btih:([a-z0-9]{32,40})/i);
+    if (!m) return '';
+    var id = m[1].toLowerCase();
+    if (id.length === 40) return id;
+    return base32ToHex(id);
+  }
+
+  function base32ToHex(s) {
+    var alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+    var bits = '';
+    for (var i = 0; i < s.length; i++) {
+      var v = alphabet.indexOf(s[i]);
+      if (v < 0) return '';
+      bits += ('00000' + v.toString(2)).slice(-5);
+    }
+    var hex = '';
+    for (var j = 0; j + 4 <= bits.length; j += 4) hex += parseInt(bits.slice(j, j + 4), 2).toString(16);
+    return hex.slice(0, 40);
+  }
+
+  function sourceOf(title) {
+    for (var i = 0; i < SOURCES.length; i++) {
+      if (SOURCES[i][0].test(title)) return { label: SOURCES[i][1], score: SOURCES[i][2] };
+    }
+    return { label: '', score: 7 };
+  }
+
   function resolutionOf(element, title, source) {
     var q = element.info ? parseInt(element.info.quality, 10) : 0;
     if (q >= 2160 || RE_4K.test(title)) return 2160;
@@ -143,13 +236,6 @@
     // the tracker reports 480 whenever it does not know; trust it only for SD sources
     if (q === 480 && !source.label) return 0;
     return q || 0;
-  }
-
-  function sourceOf(title) {
-    for (var i = 0; i < SOURCES.length; i++) {
-      if (SOURCES[i][0].test(title)) return { label: SOURCES[i][1], score: SOURCES[i][2] };
-    }
-    return { label: '', score: 7 };
   }
 
   function voicesOf(element, title) {
@@ -209,7 +295,7 @@
   }
 
   // which episodes a pack holds: "[49-96 из 175]", "1-328 серии из 328",
-  // "[175 из 175]", "S01E05", plus the seasons it covers
+  // "[175 из 175]", "S01E05", "137 серия", plus the seasons it covers
   function coverageOf(element, title) {
     var from = 0;
     var to = 0;
@@ -221,8 +307,10 @@
       from = 1; to = +m[1];
     } else if ((m = title.match(/(?:серии|серий|эпизоды)\s*:?\s*(\d{1,4})\s*-\s*(\d{1,4})/i))) {
       from = +m[1]; to = +m[2];
-    } else if ((m = title.match(/s\d{1,2}e(\d{1,4})(?:\s*-\s*e?(\d{1,4}))?/i))) {
+    } else if ((m = title.match(/s\d{1,2}\s*e(\d{1,4})(?:\s*-\s*e?(\d{1,4}))?/i))) {
       from = +m[1]; to = m[2] ? +m[2] : +m[1];
+    } else if ((m = title.match(/(?:^|[^\d])(\d{1,4})\s*(?:-?я\s+)?серия(?:[^\d]|$)/i)) || (m = title.match(/(?:^|[^a-z])ep(?:isode)?\.?\s*(\d{1,4})(?:[^\d]|$)/i))) {
+      from = +m[1]; to = +m[1];
     }
 
     var seasons = element.info && element.info.seasons && element.info.seasons.length ? element.info.seasons.slice() : null;
@@ -281,7 +369,31 @@
     return size * 8 / (parts * minutes * 60) / 1000000;
   }
 
+  // --- releases already in TorrServer ------------------------------------------
+
+  var cached = {};
+
+  function refreshCached() {
+    if (!CONFIG.cachedBoost) return;
+    var base;
+    try { base = Lampa.Torserver.url(); } catch (e) { return; }
+    if (!base) return;
+
+    var network = new Lampa.Reguest();
+    network.timeout(3000);
+    network.silent(base + '/torrents', function (list) {
+      var next = {};
+      (Array.isArray(list) ? list : []).forEach(function (t) { if (t && t.hash) next[(t.hash + '').toLowerCase()] = true; });
+      cached = next;
+    }, function () {}, JSON.stringify({ action: 'list' }));
+  }
+
   // --- scoring ---------------------------------------------------------------
+
+  function plural(n, one, few, many) {
+    var a = n % 10, b = n % 100;
+    return n + ' ' + (a === 1 && b !== 11 ? one : a >= 2 && a <= 4 && (b < 10 || b >= 20) ? few : many);
+  }
 
   function score(element, card, need, learned) {
     var title = text(element);
@@ -292,6 +404,7 @@
     var coverage = coverageOf(element, title);
     var seeds = seedersOf(element);
     var mbit = mbitOf(element, card, coverage);
+    var sizeGb = sizeOf(element) / GB;
 
     var raw = 0;
     var tags = [];
@@ -327,6 +440,14 @@
       else raw += 8;
     }
 
+    // a film should weigh a sensible amount for its resolution
+    if (!isSerial(card) && sizeGb) {
+      var range = CONFIG.filmSizeGb[res] || CONFIG.filmSizeGb[1080];
+      if (sizeGb < range[0]) { raw -= 8; tag('маленький ' + sizeGb.toFixed(1) + ' ГБ', 'warn'); }
+      else if (sizeGb > range[1]) { raw -= 8; tag('огромный ' + Math.round(sizeGb) + ' ГБ', 'warn'); }
+      else raw += 4;
+    }
+
     if (audio.heavy) { raw -= 6; tag('TrueHD/DTS', 'warn'); }
 
     // the episode the viewer needs
@@ -354,13 +475,17 @@
 
     if (element.viewed) raw += 10;
 
+    var btih = btihOf(element);
+    if (btih && cached[btih]) { raw += 12; tag('уже в кеше', 'good'); }
+
     raw += Math.min(20, 8 * Math.log(1 + seeds) / Math.LN10);
-    tag(seeds + ' сид' + (seeds % 10 === 1 && seeds % 100 !== 11 ? '' : seeds % 10 >= 2 && seeds % 10 <= 4 && (seeds % 100 < 10 || seeds % 100 >= 20) ? 'а' : 'ов'));
+    tag(plural(seeds, 'сид', 'сида', 'сидов'));
 
     element.smart_score = Math.max(0, Math.min(100, Math.round(raw / 1.25)));
     element.smart_tags = tags;
     element.smart_voices = voices.concat(audio.label ? [audio.label] : []);
     element.smart_rus = audio.rus;
+    element.smart_btih = btih;
     return element.smart_score;
   }
 
@@ -388,6 +513,7 @@
     viewed.sort(by);
     rest.sort(by);
     data.Results = viewed.concat(rest);
+    data.Results.forEach(function (element, index) { element.smart_rank = index; });
   }
 
   // --- filtering before the list is built ------------------------------------
@@ -406,7 +532,8 @@
     var out = [];
 
     list.forEach(function (element) {
-      var key = text(element).toLowerCase().replace(/\s+/g, ' ') + '|' + Math.round(sizeOf(element) / (256 * 1024 * 1024));
+      var id = btihOf(element);
+      var key = id || (text(element).toLowerCase().replace(/\s+/g, ' ') + '|' + Math.round(sizeOf(element) / (256 * 1024 * 1024)));
       var have = seen[key];
       if (!have) { seen[key] = element; out.push(element); }
       else if (seedersOf(element) > seedersOf(have)) { out[out.indexOf(have)] = element; seen[key] = element; }
@@ -418,31 +545,32 @@
   var current = { data: null, card: null };
 
   // Every release list passes through Lampa.Parser.get before the torrents
-  // component sees it, so filtering here keeps counters, filters and paging
-  // consistent.
+  // component sees it, so filtering here keeps the component's own
+  // counters, filters and paging consistent.
   function wrapParser() {
     var original = Lampa.Parser.get;
 
     Lampa.Parser.get = function (object, oncomplite, onerror) {
-      original(object, function (data) {
+      original(object, safe(function (data) {
         if (data && data.Results && data.Results.length) {
+          var card = object && object.movie;
           var list = data.Results.filter(keep);
           if (CONFIG.dedupe) list = dedupe(list);
           if (CONFIG.hideNoRussian) {
-            scoreAll(list, object && object.movie);
+            scoreAll(list, card);
             var rus = list.filter(function (e) { return e.smart_rus !== false; });
             if (rus.length) list = rus;
           }
           // a short list beats no list
           if (list.length) data.Results = list;
 
-          scoreAll(data.Results, object && object.movie);
+          scoreAll(data.Results, card);
           if (CONFIG.smartSort) sortList(data);
 
-          current = { data: data, card: object && object.movie };
+          current = { data: data, card: card };
         }
         oncomplite(data);
-      }, onerror);
+      }, 'parser'), onerror);
     };
   }
 
@@ -475,6 +603,11 @@
     var value = element.smart_score;
     var grade = value >= 70 ? 'good' : value >= 45 ? 'ok' : 'bad';
 
+    if (CONFIG.markBest && CONFIG.smartSort && element.smart_rank === 0 && value >= CONFIG.bestMinScore) {
+      box.append('<span class="tsmart__best">лучший выбор</span>');
+      item.addClass('torrent-item--best');
+    }
+
     box.append('<span class="tsmart__score tsmart__score--' + grade + '">' + value + '</span>');
 
     (element.smart_tags || []).slice(0, 6).forEach(function (t) {
@@ -484,16 +617,6 @@
     });
 
     item.find('.torrent-item__title').after(box);
-
-    if (!CONFIG.markBest || value < CONFIG.bestMinScore) return;
-
-    // the first row of a freshly built list is the best one after sorting;
-    // the row is appended right after this event fires
-    setTimeout(function () {
-      if (item.index('.torrent-item') !== 0 && item.prevAll('.torrent-item').length) return;
-      item.addClass('torrent-item--best');
-      box.prepend('<span class="tsmart__best">лучший выбор</span>');
-    }, 0);
   }
 
   function learn(element) {
@@ -513,24 +636,29 @@
   }
 
   function followRows() {
-    Lampa.Listener.follow('torrent', function (event) {
+    Lampa.Listener.follow('torrent', safe(function (event) {
       if (!event.element || !event.item) return;
       if (event.type === 'render') drawRow(event.element, event.item);
       if (event.type === 'onenter') learn(event.element);
-    });
+    }, 'torrent'));
+
+    Lampa.Listener.follow('activity', safe(function (event) {
+      if (event.type === 'create' && event.component === 'torrents') refreshCached();
+    }, 'activity'));
   }
 
   // --- file list inside a release ----------------------------------------------
 
   var files = [];
   var fileTimer = null;
-  var auto = { timer: null, bar: null };
+  var auto = { timer: null, bar: null, badge: null, label: '' };
 
   function stopAuto() {
     clearInterval(auto.timer);
     auto.timer = null;
     if (auto.bar) auto.bar.remove();
     auto.bar = null;
+    if (auto.badge) auto.badge.text('▶ ' + auto.label);
     Lampa.Keypad.listener.remove('keydown', stopAuto);
   }
 
@@ -542,14 +670,15 @@
     auto.bar = $('<div class="torrent-serial__progress"></div>');
     item.prepend(auto.bar);
 
-    auto.timer = setInterval(function () {
+    auto.timer = setInterval(safe(function () {
       var passed = Date.now() - started;
       if (auto.bar) auto.bar.css('height', Math.min(100, Math.round(passed / total * 100)) + '%');
+      if (auto.badge) auto.badge.text('▶ ' + auto.label + ' · ' + Math.max(0, Math.ceil((total - passed) / 1000)));
       if (passed >= total) {
         stopAuto();
         item.trigger('hover:enter');
       }
-    }, 50);
+    }, 'countdown'), 100);
 
     Lampa.Keypad.listener.follow('keydown', stopAuto);
   }
@@ -587,15 +716,18 @@
     if (index < 0 || index >= files.length) return;
 
     var target = files[index].item;
-    var badge = '<span class="tsmart-resume">▶ ' + label + '</span>';
+    var badge = $('<span class="tsmart-resume">▶ ' + label + '</span>');
     var line = target.find('.torrent-serial__line').first();
     // titles are cut with an ellipsis, so the badge goes on the line below or in front
     if (line.length) line.prepend(badge);
     else target.find('.torrent-files__title, .torrent-file__title').first().prepend(badge);
 
+    auto.badge = badge;
+    auto.label = label;
+
     focusFile(target, 0);
 
-    if (CONFIG.autoPlay) startAuto(target);
+    if (CONFIG.autoPlaySeconds > 0) startAuto(target);
   }
 
   // A long list scrolls by transform, rows far from the screen are laid out
@@ -628,26 +760,30 @@
   }
 
   function followFiles() {
-    Lampa.Listener.follow('torrent_file', function (event) {
+    Lampa.Listener.follow('torrent_file', safe(function (event) {
       if (event.type === 'list_open') {
         files = [];
         stopAuto();
+        auto.badge = null;
       } else if (event.type === 'render' && CONFIG.focusEpisode) {
         files.push({ item: event.item, element: event.element });
         clearTimeout(fileTimer);
-        fileTimer = setTimeout(function () { pickFile(event.params); }, 80);
+        fileTimer = setTimeout(safe(function () { pickFile(event.params); }, 'pickFile'), 80);
       } else if (event.type === 'list_close' || event.type === 'onenter') {
         stopAuto();
       }
-    });
+    }, 'torrent_file'));
   }
 
   // --- start -------------------------------------------------------------------
 
-  function start() {
+  var start = safe(function () {
     var style = document.createElement('style');
     style.textContent = css;
     document.head.appendChild(style);
+
+    registerSettings();
+    applySettings();
 
     // the first version of this plugin switched the order to seeders
     if (!Lampa.Storage.get('torrents_smart_v2', false)) {
@@ -659,7 +795,10 @@
     wrapComponent();
     followRows();
     followFiles();
-  }
+    refreshCached();
+
+    console.log('[dvp] torrents-sort ' + VERSION);
+  }, 'start');
 
   if (window.appready) start();
   else Lampa.Listener.follow('app', function (event) { if (event.type === 'ready') start(); });

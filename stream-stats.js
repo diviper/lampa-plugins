@@ -1,26 +1,35 @@
 /*
  * stream-stats.js — playback diagnostics overlay for the Lampa player
+ * Version 1.1.0
  *
- * Shows, once a second, why a stream stutters: resolution, buffered seconds
- * ahead of the playhead, buffer fill rate (>1x means the source is faster
- * than playback), dropped frames and, for TorrServe streams, download speed,
- * peers and seeders.
+ * Shows why a stream stutters: resolution, buffered seconds ahead of the
+ * playhead, buffer fill rate (>1x means the source is faster than playback),
+ * dropped frames and, for TorrServe streams, download speed, peers and
+ * seeders. The overlay shows for a few seconds after start, then only while
+ * the player panel is open or while the stream is in trouble. It also warns
+ * out loud when playback cannot keep up or freezes for want of data.
  *
  * Works in the built-in Lampa player only; external players (VLC, MX) have
  * their own statistics screens.
  *
+ * Settings: Lampa → Settings → My plugins.
  * Install: Settings → Extensions → Add plugin → https://diviper.github.io/lampa-plugins/stream-stats.js
  */
 
 (function () {
   'use strict';
 
+  var VERSION = '1.1.0';
+
   var CONFIG = {
     interval: 1000,          // ms between overlay updates
     torrentInterval: 2000,   // ms between TorrServe statistics requests
-    hideWithPanel: false,    // true = show only while the player panel is visible
     position: 'top-right',   // top-left | top-right | bottom-left | bottom-right
     fontSize: '1.05em',
+
+    show: 'auto',            // auto = 8 s after start, then with the panel or in trouble; always; panel
+    showFor: 8000,           // ms the overlay stays after playback starts
+    compact: false,          // one line instead of a column
 
     warn: true,              // say it out loud when the stream cannot keep up
     warnAfterSeconds: 8,     // how long inflow must stay below 1x
@@ -31,19 +40,75 @@
   };
 
   if (window.lampa_plugin_stream_stats) return;
-  window.lampa_plugin_stream_stats = true;
+  window.lampa_plugin_stream_stats = VERSION;
+
+  // --- shared bits: settings section, guarded handlers -----------------------
+
+  var SETTINGS = 'dvp';
+  var ICON = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="4" width="18" height="16" rx="3" stroke="currentColor" stroke-width="2"/><path d="M8 9h8M8 13h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
+  function safe(fn, where) {
+    return function () {
+      try { return fn.apply(this, arguments); }
+      catch (e) { console.error('[dvp stats] ' + (where || ''), e); }
+    };
+  }
+
+  function settingsSection() {
+    if (window.dvp_settings) return;
+    window.dvp_settings = true;
+    Lampa.SettingsApi.addComponent({ component: SETTINGS, icon: ICON, name: 'Мои плагины' });
+  }
+
+  function heading(name) {
+    Lampa.SettingsApi.addParam({ component: SETTINGS, param: { name: 'dvp_head_' + name, type: 'title' }, field: { name: name } });
+  }
+
+  function option(key, def, name, description, values) {
+    Lampa.SettingsApi.addParam({
+      component: SETTINGS,
+      param: { name: 'dvp_' + key, type: values ? 'select' : 'trigger', values: values, default: def },
+      field: { name: name, description: description }
+    });
+  }
+
+  function opt(key, def) {
+    var value = Lampa.Storage.get('dvp_' + key, def);
+    return value === '' ? def : value;
+  }
+
+  function applySettings() {
+    CONFIG.show = opt('stats_show', CONFIG.show);
+    CONFIG.compact = opt('stats_compact', CONFIG.compact);
+    CONFIG.warn = opt('stats_warn', CONFIG.warn);
+  }
+
+  function registerSettings() {
+    settingsSection();
+    heading('Статистика потока ' + VERSION);
+    option('stats_show', 'auto', 'Когда показывать цифры', 'Во встроенном плеере Lampa', { auto: 'Первые секунды и при проблемах', panel: 'Только с панелью плеера', always: 'Всегда' });
+    option('stats_compact', false, 'Одной строкой', 'Компактный вид вместо столбика');
+    option('stats_warn', true, 'Предупреждать о слабом потоке', 'Сообщение, когда буфер не набирается или видео встало');
+    Lampa.Storage.listener.follow('change', safe(function (event) {
+      if (event.name && event.name.indexOf('dvp_stats_') === 0) applySettings();
+    }, 'settings'));
+  }
 
   var box, timer, torrentTimer, network;
   var last = { time: 0, ahead: 0, position: -1 };
   var torrent = null;
   var weakSeconds = 0;
   var warnedAt = 0;
+  var shownAt = 0;
+  var panelVisible = false;
+  var trouble = false;
 
   var css = [
     '.stream-stats{position:absolute;z-index:8;padding:.55em .8em;border-radius:.6em;background:rgba(0,0,0,.55);',
     'color:#fff;font-size:' + CONFIG.fontSize + ';line-height:1.35;pointer-events:none;white-space:nowrap;text-shadow:0 1px 2px rgba(0,0,0,.6)}',
     '.stream-stats--top-right{top:1.2em;right:1.2em}.stream-stats--top-left{top:1.2em;left:1.2em}',
     '.stream-stats--bottom-right{bottom:6em;right:1.2em}.stream-stats--bottom-left{bottom:6em;left:1.2em}',
+    '.stream-stats--compact .stream-stats__row{display:inline}.stream-stats--compact .stream-stats__row+.stream-stats__row:before{content:" · ";opacity:.5}',
     '.stream-stats__row span{opacity:.6;margin-right:.4em}',
     '.stream-stats--ok{color:#8be28b}.stream-stats--warn{color:#ffd166}.stream-stats--bad{color:#ff6b6b}'
   ].join('');
@@ -74,23 +139,30 @@
   // that is running but losing ground, and playback frozen for want of data.
   // A deliberate pause keeps readyState at HAVE_ENOUGH_DATA, so it stays quiet.
   function warn(video, rate, ahead, moving, dt, now) {
-    if (!CONFIG.warn) return;
-
     var stalled = !moving && video.readyState < 3;
     var weak = !video.paused && rate < 1 && ahead < CONFIG.warnBufferSeconds;
 
-    if (!stalled && !weak) {
+    trouble = stalled || weak;
+
+    if (!trouble) {
       weakSeconds = 0;
       return;
     }
 
     weakSeconds += dt;
 
-    if (weakSeconds < CONFIG.warnAfterSeconds || now - warnedAt < CONFIG.warnCooldown) return;
+    if (!CONFIG.warn || weakSeconds < CONFIG.warnAfterSeconds || now - warnedAt < CONFIG.warnCooldown) return;
 
     warnedAt = now;
     weakSeconds = 0;
     Lampa.Noty.show(stalled ? CONFIG.stallText : CONFIG.warnText, { time: 6000 });
+  }
+
+  function shouldShow(now) {
+    if (CONFIG.show === 'always') return true;
+    if (panelVisible) return true;
+    if (CONFIG.show === 'panel') return false;
+    return trouble || now - shownAt < CONFIG.showFor;
   }
 
   function render() {
@@ -117,7 +189,7 @@
 
     if (video.getVideoPlaybackQuality) {
       var q = video.getVideoPlaybackQuality();
-      rows.push('<div class="stream-stats__row ' + rowClass(-q.droppedVideoFrames, 0, -50) + '"><span>кадры</span>' + q.droppedVideoFrames + ' пропущено из ' + q.totalVideoFrames + '</div>');
+      rows.push('<div class="stream-stats__row ' + rowClass(-q.droppedVideoFrames, 0, -50) + '"><span>кадры</span>' + q.droppedVideoFrames + ' из ' + q.totalVideoFrames + '</div>');
     }
 
     if (torrent) {
@@ -127,6 +199,8 @@
 
     last = { time: now, ahead: ahead, position: video.currentTime };
     box.innerHTML = rows.join('');
+    box.className = 'stream-stats stream-stats--' + CONFIG.position + (CONFIG.compact ? ' stream-stats--compact' : '');
+    box.style.display = shouldShow(now) ? '' : 'none';
   }
 
   function pollTorrent(data) {
@@ -155,7 +229,9 @@
     torrent = null;
     weakSeconds = 0;
     warnedAt = 0;
-    timer = setInterval(render, CONFIG.interval);
+    trouble = false;
+    shownAt = Date.now();
+    timer = setInterval(safe(render, 'render'), CONFIG.interval);
     pollTorrent(data);
   }
 
@@ -168,20 +244,23 @@
     torrent = null;
   }
 
-  function start() {
+  var start = safe(function () {
     var style = document.createElement('style');
     style.textContent = css;
     document.head.appendChild(style);
 
-    Lampa.Player.listener.follow('start', show);
-    Lampa.Player.listener.follow('destroy', hide);
+    registerSettings();
+    applySettings();
 
-    if (CONFIG.hideWithPanel) {
-      Lampa.PlayerPanel.listener.follow('visible', function (event) {
-        if (box) box.style.display = event.status ? '' : 'none';
-      });
-    }
-  }
+    Lampa.Player.listener.follow('start', safe(show, 'start'));
+    Lampa.Player.listener.follow('destroy', safe(hide, 'destroy'));
+    Lampa.PlayerPanel.listener.follow('visible', safe(function (event) {
+      panelVisible = !!event.status;
+      if (box) box.style.display = shouldShow(Date.now()) ? '' : 'none';
+    }, 'panel'));
+
+    console.log('[dvp] stream-stats ' + VERSION);
+  }, 'start');
 
   if (window.appready) start();
   else Lampa.Listener.follow('app', function (event) { if (event.type === 'ready') start(); });

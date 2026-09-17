@@ -1,16 +1,20 @@
 /*
  * continue.js — "Continue watching" row for Lampa
+ * Version 3.1.0
  *
  * Adds the viewing history as the first row of the home screen, regardless of
  * media type. Each card shows how far it was watched and which episode is
  * next, and selecting a card reopens the list it was last watched from —
  * online sources or torrents — and picks up at the right episode.
  *
+ * Settings: Lampa → Settings → My plugins.
  * Install: Settings → Extensions → Add plugin → https://diviper.github.io/lampa-plugins/continue.js
  */
 
 (function () {
   'use strict';
+
+  var VERSION = '3.1.0';
 
   var CONFIG = {
     rowName: 'continue_all',        // storage key: content_rows_continue_all (Settings → Home rows)
@@ -19,6 +23,8 @@
     hideBuiltInRow: true,           // the stock row only lists non-Japanese series
 
     showProgress: true,             // progress strip and episode badge on the cards
+    finished: 'end',                // finished films: 'end' = move to the end, 'hide' = drop, 'keep'
+    finishedPercent: 90,
     maxSeasons: 10,                 // scan depth when the card does not report its season count
     maxEpisodes: 300,               // scan depth per season
     decorateTries: 20,              // attempts, 300 ms apart, to catch the row once it is drawn
@@ -43,9 +49,65 @@
   };
 
   if (window.lampa_plugin_continue) return;
-  window.lampa_plugin_continue = true;
+  window.lampa_plugin_continue = VERSION;
+
+  // --- shared bits: settings section, guarded handlers -----------------------
+
+  var SETTINGS = 'dvp';
+  var ICON = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="4" width="18" height="16" rx="3" stroke="currentColor" stroke-width="2"/><path d="M8 9h8M8 13h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
+  function safe(fn, where) {
+    return function () {
+      try { return fn.apply(this, arguments); }
+      catch (e) { console.error('[dvp continue] ' + (where || ''), e); }
+    };
+  }
+
+  function settingsSection() {
+    if (window.dvp_settings) return;
+    window.dvp_settings = true;
+    Lampa.SettingsApi.addComponent({ component: SETTINGS, icon: ICON, name: 'Мои плагины' });
+  }
+
+  function heading(name) {
+    Lampa.SettingsApi.addParam({ component: SETTINGS, param: { name: 'dvp_head_' + name, type: 'title' }, field: { name: name } });
+  }
+
+  function option(key, def, name, description, values) {
+    Lampa.SettingsApi.addParam({
+      component: SETTINGS,
+      param: { name: 'dvp_' + key, type: values ? 'select' : 'trigger', values: values, default: def },
+      field: { name: name, description: description }
+    });
+  }
+
+  function opt(key, def) {
+    var value = Lampa.Storage.get('dvp_' + key, def);
+    return value === '' ? def : value;
+  }
+
+  function applySettings() {
+    CONFIG.showProgress = opt('continue_progress', CONFIG.showProgress);
+    CONFIG.autoPlayNext = opt('continue_autoplay', CONFIG.autoPlayNext);
+    CONFIG.autoOpenRelease = opt('continue_release', CONFIG.autoOpenRelease);
+    CONFIG.finished = opt('continue_finished', CONFIG.finished);
+  }
+
+  function registerSettings() {
+    settingsSection();
+    heading('Продолжить просмотр ' + VERSION);
+    option('continue_progress', true, 'Серия и прогресс на карточках', 'Номер серии и полоска досмотра в строке «Продолжить просмотр»');
+    option('continue_autoplay', true, 'OK сразу включает серию', 'Для онлайна: после открытия списка серий сам нажимает ту, на которой остановились');
+    option('continue_release', true, 'OK открывает прошлую раздачу', 'Для торрентов: сам открывает раздачу, которую уже смотрели');
+    option('continue_finished', 'end', 'Досмотренные фильмы', 'Что делать с фильмами, досмотренными до конца', { end: 'В конец строки', hide: 'Убирать', keep: 'Как есть' });
+    Lampa.Storage.listener.follow('change', safe(function (event) {
+      if (event.name && event.name.indexOf('dvp_continue_') === 0) applySettings();
+    }, 'settings'));
+  }
 
   var pendingCardId = null;
+  var rowCards = [];              // {node, card} of the row on screen, for live badge updates
+  var refreshTimer = null;
 
   var css = [
     '.card__view{position:relative}',
@@ -169,6 +231,13 @@
     return store(CONFIG.hashKey)[id] || null;
   }
 
+  function finishedFilm(card) {
+    if (isSerial(card)) return false;
+    var position = positionOf(card);
+    if (!position) return false;
+    return Lampa.Timeline.view(position.hash).percent >= CONFIG.finishedPercent;
+  }
+
   // --- the row ---------------------------------------------------------------
 
   function history() {
@@ -176,8 +245,17 @@
       .concat(Lampa.Favorite.get({ type: 'thrown' }))
       .map(function (card) { return card.id; });
 
-    return Lampa.Favorite.get({ type: 'history' })
-      .filter(function (card) { return seen.indexOf(card.id) === -1; })
+    var list = Lampa.Favorite.get({ type: 'history' })
+      .filter(function (card) { return seen.indexOf(card.id) === -1; });
+
+    if (CONFIG.finished !== 'keep') {
+      var open = [];
+      var done = [];
+      list.forEach(function (card) { (finishedFilm(card) ? done : open).push(card); });
+      list = CONFIG.finished === 'hide' ? open : open.concat(done);
+    }
+
+    return list
       .slice(0, CONFIG.maxItems)
       .map(function (card) {
         var copy = Lampa.Arrays.clone(card);
@@ -187,7 +265,8 @@
   }
 
   function decorateCard(node, card) {
-    if (!card || node.find('.continue-badge, .continue-line').length) return;
+    node.find('.continue-badge, .continue-line').remove();
+    if (!card || !CONFIG.showProgress) return;
 
     var position = positionOf(card);
     if (!position) return;
@@ -227,7 +306,7 @@
 
     var tries = 0;
 
-    var timer = setInterval(function () {
+    var timer = setInterval(safe(function () {
       tries++;
 
       var line = findRow();
@@ -238,8 +317,22 @@
       if (!ready && tries <= CONFIG.decorateTries) return;   // the row is still filling up
 
       clearInterval(timer);
-      cards.each(function (index) { decorateCard($(this), results[index]); });
-    }, 300);
+      rowCards = [];
+      cards.each(function (index) {
+        var node = $(this);
+        rowCards.push({ node: node, card: results[index] });
+        decorateCard(node, results[index]);
+      });
+    }, 'decorateRow'), 300);
+  }
+
+  // positions change while watching; redraw the badges of the row on screen
+  function refreshRow() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(safe(function () {
+      rowCards = rowCards.filter(function (entry) { return document.body.contains(entry.node[0]); });
+      rowCards.forEach(function (entry) { decorateCard(entry.node, entry.card); });
+    }, 'refreshRow'), 600);
   }
 
   function addRow() {
@@ -248,7 +341,7 @@
       title: Lampa.Lang.translate('title_continue'),
       index: CONFIG.rowIndex,
       screen: ['main'],
-      call: function () {
+      call: safe(function () {
         var results = history();
         if (!results.length) return;
 
@@ -256,7 +349,7 @@
           call({ results: results, title: Lampa.Lang.translate('title_continue') });
           decorateRow(results);
         };
-      }
+      }, 'row')
     });
   }
 
@@ -266,7 +359,7 @@
     var started = Date.now();
     var component = Lampa.Activity.active().component;
 
-    var timer = setInterval(function () {
+    var timer = setInterval(safe(function () {
       var active = Lampa.Activity.active().component;
 
       if (active !== component || Date.now() - started > CONFIG.autoPlayTimeout) return clearInterval(timer);
@@ -288,7 +381,7 @@
       if (view.percent >= CONFIG.nextThreshold && rows.length > index + 1) target = rows.eq(index + 1);
 
       target.trigger('hover:enter');
-    }, CONFIG.autoPlayPoll);
+    }, 'playEpisode'), CONFIG.autoPlayPoll);
   }
 
   // Lampa marks releases that were opened before and lists them first, so a
@@ -296,7 +389,7 @@
   function openRelease() {
     var started = Date.now();
 
-    var timer = setInterval(function () {
+    var timer = setInterval(safe(function () {
       var active = Lampa.Activity.active();
 
       if (!active || active.component !== 'torrents' || Date.now() - started > CONFIG.autoPlayTimeout) return clearInterval(timer);
@@ -306,11 +399,11 @@
 
       clearInterval(timer);
       if (first.find('.torrent-item__viewed').length) first.trigger('hover:enter');
-    }, CONFIG.autoPlayPoll);
+    }, 'openRelease'), CONFIG.autoPlayPoll);
   }
 
   function trackActivities() {
-    Lampa.Listener.follow('activity', function (event) {
+    Lampa.Listener.follow('activity', safe(function (event) {
       if (event.type !== 'create' || !event.object) return;
 
       var object = event.object;
@@ -319,25 +412,31 @@
       if (method && object.movie && object.movie.id) remember(CONFIG.methodKey, object.movie.id, method);
 
       if (event.component === 'full' && object.card && object.card.continue_row) pendingCardId = object.id;
-    });
+    }, 'activity'));
 
     // the player knows the exact hash, so keep it for titles the scan misses
-    Lampa.Player.listener.follow('start', function (data) {
+    Lampa.Player.listener.follow('start', safe(function (data) {
       var active = Lampa.Activity.active();
       var card = active && active.movie;
       if (card && card.id && data && data.timeline && data.timeline.hash) remember(CONFIG.hashKey, card.id, data.timeline.hash);
-    });
+    }, 'player'));
 
-    Lampa.Listener.follow('full', function (event) {
+    Lampa.Listener.follow('state:changed', safe(function (event) {
+      if (event.target === 'timeline' && rowCards.length) refreshRow();
+    }, 'timeline'));
+
+    Lampa.Listener.follow('full', safe(function (event) {
       if (event.type !== 'complite' || !pendingCardId || !event.object || event.object.id !== pendingCardId) return;
 
       var id = pendingCardId;
       pendingCardId = null;
 
+      if (!CONFIG.openLastMethod) return;
+
       var method = store(CONFIG.methodKey)[id];
       if (!method || !CONFIG.buttons[method]) return;
 
-      setTimeout(function () {
+      setTimeout(safe(function () {
         var button = event.object.activity.render().find(CONFIG.buttons[method]).first();
         if (!button.length) return;
 
@@ -346,8 +445,8 @@
         var hash = hashOf(id);
         if (method === 'online' && CONFIG.autoPlayNext && hash) setTimeout(function () { playEpisode(hash); }, 300);
         if (method === 'torrent' && CONFIG.autoOpenRelease) setTimeout(openRelease, 300);
-      }, CONFIG.openDelay);
-    });
+      }, 'open'), CONFIG.openDelay);
+    }, 'full'));
   }
 
   // Account plugins can arrive after the home screen is already drawn;
@@ -357,16 +456,20 @@
     if (active && active.component === 'main') Lampa.Activity.replace({});
   }
 
-  function start() {
+  var start = safe(function () {
     var style = document.createElement('style');
     style.textContent = css;
     document.head.appendChild(style);
 
+    registerSettings();
+    applySettings();
+
     if (CONFIG.hideBuiltInRow) Lampa.Storage.set('content_rows_continue_watch', false);
     addRow();
-    if (CONFIG.openLastMethod) trackActivities();
+    trackActivities();
     redrawHome();
-  }
+    console.log('[dvp] continue ' + VERSION);
+  }, 'start');
 
   if (window.appready) start();
   else Lampa.Listener.follow('app', function (event) { if (event.type === 'ready') start(); });
