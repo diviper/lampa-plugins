@@ -20,7 +20,13 @@
     torrentInterval: 2000,   // ms between TorrServe statistics requests
     hideWithPanel: false,    // true = show only while the player panel is visible
     position: 'top-right',   // top-left | top-right | bottom-left | bottom-right
-    fontSize: '1.05em'
+    fontSize: '1.05em',
+
+    warn: true,              // say it out loud when the stream cannot keep up
+    warnAfterSeconds: 8,     // how long inflow must stay below 1x
+    warnBufferSeconds: 10,   // and the buffer below this
+    warnCooldown: 90000,     // ms between warnings
+    warnText: 'Поток слабый: буфер не набирается. Смените раздачу или источник.'
   };
 
   if (window.lampa_plugin_stream_stats) return;
@@ -29,6 +35,8 @@
   var box, timer, torrentTimer, network;
   var last = { time: 0, ahead: 0 };
   var torrent = null;
+  var weakSeconds = 0;
+  var warnedAt = 0;
 
   var css = [
     '.stream-stats{position:absolute;z-index:8;padding:.55em .8em;border-radius:.6em;background:rgba(0,0,0,.55);',
@@ -60,6 +68,25 @@
     return value >= good ? 'stream-stats--ok' : value >= ok ? 'stream-stats--warn' : 'stream-stats--bad';
   }
 
+  // A stream that cannot refill its buffer will stall, so say so once in a
+  // while instead of leaving the viewer to guess.
+  function warn(rate, ahead, dt, now) {
+    if (!CONFIG.warn) return;
+
+    if (rate >= 1 || ahead > CONFIG.warnBufferSeconds) {
+      weakSeconds = 0;
+      return;
+    }
+
+    weakSeconds += dt;
+
+    if (weakSeconds < CONFIG.warnAfterSeconds || now - warnedAt < CONFIG.warnCooldown) return;
+
+    warnedAt = now;
+    weakSeconds = 0;
+    Lampa.Noty.show(CONFIG.warnText, { time: 6000 });
+  }
+
   function render() {
     var video = Lampa.PlayerVideo.video();
     if (!box || !video || !video.buffered) return;
@@ -76,6 +103,7 @@
       var dt = (now - last.time) / 1000;
       var rate = dt > 0 ? (ahead - last.ahead) / dt + 1 : 1;   // buffer growth relative to playback
       rows.push('<div class="stream-stats__row ' + rowClass(rate, 1, 0.8) + '"><span>приток</span>' + rate.toFixed(2) + 'x</div>');
+      warn(rate, ahead, dt, now);
     }
 
     if (video.getVideoPlaybackQuality) {
@@ -116,6 +144,8 @@
 
     last = { time: 0, ahead: 0 };
     torrent = null;
+    weakSeconds = 0;
+    warnedAt = 0;
     timer = setInterval(render, CONFIG.interval);
     pollTorrent(data);
   }
